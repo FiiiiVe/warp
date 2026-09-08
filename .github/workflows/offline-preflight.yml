@@ -1,0 +1,138 @@
+name: Warp Offline - Preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Inspect Current Fork
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+
+      - name: Show exact revision
+        shell: pwsh
+        run: |
+          Write-Host "Repository: $env:GITHUB_REPOSITORY"
+          Write-Host "Branch:     $env:GITHUB_REF_NAME"
+          Write-Host "Commit:     $env:GITHUB_SHA"
+
+          git log -1 --oneline
+
+      - name: Inspect prepare_bundled_resources parameters
+        shell: pwsh
+        run: |
+          $script = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "script\windows\prepare_bundled_resources.ps1"
+
+          if (-not (Test-Path $script)) {
+            throw "Missing: $script"
+          }
+
+          Write-Host "=== prepare_bundled_resources.ps1 parameters ==="
+
+          $cmd = Get-Command $script
+          $cmd.Parameters.Keys | Sort-Object | ForEach-Object {
+            Write-Host $_
+          }
+
+          Write-Host ""
+          Write-Host "=== Script param block ==="
+
+          Get-Content $script -TotalCount 80
+
+      - name: Inspect bundle.ps1 parameters
+        shell: pwsh
+        run: |
+          $script = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "script\windows\bundle.ps1"
+
+          if (-not (Test-Path $script)) {
+            throw "Missing: $script"
+          }
+
+          Write-Host "=== bundle.ps1 parameters ==="
+
+          $cmd = Get-Command $script
+          $cmd.Parameters.Keys | Sort-Object | ForEach-Object {
+            Write-Host $_
+          }
+
+          Write-Host ""
+          Write-Host "=== Relevant bundle lines ==="
+
+          Select-String `
+            -Path $script `
+            -Pattern `
+              "target_profile_dir",
+              "GITHUB_OUTPUT",
+              "SKIP_BUILD_INSTALLER",
+              "CARGO_PROFILE",
+              "prepare_bundled_resources",
+              "warp-oss" `
+            -Context 2,2
+          
+      - name: Inspect Windows assets
+        shell: pwsh
+        run: |
+          $assets = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "app\assets\windows\x64"
+
+          Write-Host "=== Windows assets ==="
+
+          if (Test-Path $assets) {
+            Get-ChildItem $assets | Select-Object Name, Length
+          }
+          else {
+            Write-Host "Directory missing: $assets"
+          }
+
+      - name: Inspect bundled resources
+        shell: pwsh
+        run: |
+          $root = $env:GITHUB_WORKSPACE
+
+          $paths = @(
+            "app\assets\bundled\bootstrap\pwsh.ps1",
+            "app\channels\oss\icon\no-padding\icon.ico",
+            "LICENSE-AGPL",
+            "LICENSE-MIT"
+          )
+
+          Write-Host "=== Expected source files ==="
+
+          foreach ($relative in $paths) {
+            $full = Join-Path $root $relative
+
+            if (Test-Path $full) {
+              Write-Host "OK      $relative"
+            }
+            else {
+              Write-Host "MISSING $relative"
+            }
+          }
+
+      - name: Inspect current offline patch
+        shell: pwsh
+        run: |
+          $file = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "app\src\auth\auth_view_body.rs"
+
+          Write-Host "=== Offline patch check ==="
+
+          Select-String `
+            -Path $file `
+            -Pattern `
+              "NetworkStatus::as_ref",
+              "allow_loginless" `
+            -Context 3,3
