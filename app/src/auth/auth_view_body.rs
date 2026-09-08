@@ -700,7 +700,9 @@ impl AuthViewBody {
 
         match self.variant {
             AuthViewVariant::Initial => {
-                if !NetworkStatus::as_ref(app).is_online() {
+                if !NetworkStatus::as_ref(app).is_online() 
+                    && !self.allow_loginless
+                {
                     let offline_contents = render_offline_contents(
                         appearance,
                         ui_builder,
