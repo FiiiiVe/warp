@@ -1,0 +1,46 @@
+name: Warp Offline V0 - Windows Build Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Windows OSS Compile Test
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+
+      - name: Prepare Warp build environment
+        uses: ./.github/actions/prepare_environment
+        with:
+          target_os: windows
+          is_self_hosted: false
+
+      - name: Show environment
+        shell: pwsh
+        run: |
+          Write-Host "Commit: $env:GITHUB_SHA"
+          Write-Host "Runner: $env:RUNNER_OS / $env:RUNNER_ARCH"
+
+          rustc --version
+          cargo --version
+          cmake --version
+
+          Write-Host "Disk:"
+          Get-PSDrive C
+
+      - name: Verify Windows release compilation
+        shell: bash
+        run: |
+          ./script/bundle \
+            --channel oss \
+            --nouniversal \
+            --check-only
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
