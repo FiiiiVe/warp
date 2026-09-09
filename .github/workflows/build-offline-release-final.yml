@@ -1,0 +1,1288 @@
+name: Warp Offline - Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Build mode"
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - package-only
+
+      source_run_id:
+        description: "package-only: workflow run ID containing warp-offline-v0-build"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+
+jobs:
+
+  # ============================================================
+  # 1. PREFLIGHT
+  #
+  # 只有 full 模式执行。
+  #
+  # 所有能够静态检查的问题都尽量在这里发现，
+  # 避免开始 50+ 分钟编译后才发现脚本接口已经变化。
+  # ============================================================
+  preflight:
+    name: Preflight
+
+    if: ${{ inputs.mode == 'full' }}
+
+    runs-on: windows-latest
+    timeout-minutes: 5
+
+    steps:
+
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Show revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Repository:"
+          Write-Host $env:GITHUB_REPOSITORY
+
+          Write-Host ""
+          Write-Host "Branch:"
+          Write-Host $env:GITHUB_REF_NAME
+
+          Write-Host ""
+          Write-Host "Workflow commit:"
+          Write-Host $env:GITHUB_SHA
+
+          Write-Host ""
+          Write-Host "Checkout commit:"
+          git rev-parse HEAD
+
+
+      # ========================================================
+      # prepare_bundled_resources.ps1 接口检查
+      #
+      # 当前已验证接口：
+      #
+      #   DestinationDir
+      #   Channel
+      #
+      # 同时检查我们实际依赖的：
+      #
+      #   cargo about
+      #   SETTINGS_SCHEMA_EXECUTABLE
+      #   settings_schema.json
+      # ========================================================
+      - name: Verify resource script contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $script = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "script\windows\prepare_bundled_resources.ps1"
+
+          if (-not (Test-Path $script)) {
+            throw "Missing resource script: $script"
+          }
+
+          $cmd = Get-Command $script
+
+          Write-Host "Supported resource script parameters:"
+
+          $cmd.Parameters.Keys |
+            Sort-Object |
+            ForEach-Object {
+              Write-Host "  $_"
+            }
+
+          foreach ($required in @(
+            "DestinationDir",
+            "Channel"
+          )) {
+            if (-not $cmd.Parameters.ContainsKey($required)) {
+              throw "Resource script no longer supports required parameter: $required"
+            }
+          }
+
+          $text = Get-Content $script -Raw
+
+          foreach ($requiredText in @(
+            "cargo about generate",
+            "SETTINGS_SCHEMA_EXECUTABLE",
+            "settings_schema.json"
+          )) {
+            if (-not $text.Contains($requiredText)) {
+              throw "Resource script contract changed. Missing expected text: $requiredText"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Resource script contract OK"
+
+
+      # ========================================================
+      # bundle.ps1 接口检查
+      #
+      # 当前实际依赖：
+      #
+      #   CHANNEL
+      #   ARCH
+      #   SKIP_BUILD_INSTALLER
+      #
+      # 并要求它通过 GITHUB_OUTPUT 返回：
+      #
+      #   target_profile_dir
+      #   binary_path
+      # ========================================================
+      - name: Verify bundle script contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $script = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "script\windows\bundle.ps1"
+
+          if (-not (Test-Path $script)) {
+            throw "Missing bundle script: $script"
+          }
+
+          $cmd = Get-Command $script
+
+          foreach ($required in @(
+            "CHANNEL",
+            "ARCH",
+            "SKIP_BUILD_INSTALLER"
+          )) {
+            if (-not $cmd.Parameters.ContainsKey($required)) {
+              throw "bundle.ps1 no longer supports parameter: $required"
+            }
+          }
+
+          $text = Get-Content $script -Raw
+
+          foreach ($requiredOutput in @(
+            "target_profile_dir=",
+            "binary_path="
+          )) {
+            if (-not $text.Contains($requiredOutput)) {
+              throw "bundle.ps1 no longer publishes expected output: $requiredOutput"
+            }
+          }
+
+          Write-Host "Bundle script contract OK"
+
+
+      # ========================================================
+      # Offline V0 Patch 检查
+      #
+      # 避免以后 Sync Fork 后，我们自己的离线改动被覆盖，
+      # 却继续编了 50 分钟。
+      # ========================================================
+      - name: Verify Offline V0 patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $file = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "app\src\auth\auth_view_body.rs"
+
+          if (-not (Test-Path $file)) {
+            throw "Missing auth source: $file"
+          }
+
+          $text = Get-Content $file -Raw
+
+          $pattern = `
+            '(?s)!NetworkStatus::as_ref\(app\)\.is_online\(\)\s*&&\s*!self\.allow_loginless'
+
+          if ($text -notmatch $pattern) {
+            throw "Offline V0 auth patch is missing."
+          }
+
+          Write-Host "Offline V0 auth patch OK"
+
+
+      # ========================================================
+      # Portable 所需源文件检查
+      # ========================================================
+      - name: Verify portable source files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+
+          $required = @(
+            "app\assets\windows\x64\conpty.dll",
+            "app\assets\windows\x64\OpenConsole.exe",
+            "app\assets\windows\x64\dxcompiler.dll",
+            "app\assets\windows\x64\dxil.dll",
+            "app\assets\windows\x64\msvcp140.dll",
+            "app\assets\windows\x64\vcruntime140.dll",
+            "app\assets\windows\x64\vcruntime140_1.dll",
+            "app\assets\bundled\bootstrap\pwsh.ps1",
+            "app\channels\oss\icon\no-padding\icon.ico",
+            "LICENSE-AGPL",
+            "LICENSE-MIT",
+            "resources"
+          )
+
+          foreach ($relative in $required) {
+            $path = Join-Path $root $relative
+
+            if (-not (Test-Path $path)) {
+              throw "Required portable source missing: $relative"
+            }
+
+            Write-Host "OK  $relative"
+          }
+
+          Write-Host ""
+          Write-Host "Portable source files OK"
+
+
+
+  # ============================================================
+  # 2. BUILD
+  #
+  # 只有 full 模式运行。
+  #
+  # 这是昂贵的 ~50 分钟阶段。
+  #
+  # 一旦完成：
+  #
+  #   warp-oss.exe
+  #   BUILD-CHECKPOINT.txt
+  #
+  # 会立刻保存为 artifact。
+  #
+  # 后面的 Package 再出问题，不需要重新 Build。
+  # ============================================================
+  build:
+    name: Build Warp OSS
+
+    if: ${{ inputs.mode == 'full' }}
+
+    needs:
+      - preflight
+
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+
+      - name: Prepare Warp build environment
+        uses: ./.github/actions/prepare_environment
+        with:
+          target_os: windows
+          is_self_hosted: false
+
+
+      # ========================================================
+      # 使用 Warp 官方 bundle.ps1 编译 OSS Binary，
+      # 但不生成 Installer。
+      # ========================================================
+      - name: Build Warp OSS binary
+        id: build
+
+        shell: pwsh
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & .\script\windows\bundle.ps1 `
+            -CHANNEL oss `
+            -ARCH x64 `
+            -SKIP_BUILD_INSTALLER
+
+          if (-not $?) {
+            throw "Warp OSS build failed"
+          }
+
+
+      # ========================================================
+      # 验证官方脚本实际输出。
+      # ========================================================
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $binary = "${{ steps.build.outputs.binary_path }}"
+          $target = "${{ steps.build.outputs.target_profile_dir }}"
+
+          Write-Host "Binary:"
+          Write-Host $binary
+
+          Write-Host ""
+          Write-Host "Target profile:"
+          Write-Host $target
+
+          if ([string]::IsNullOrWhiteSpace($binary)) {
+            throw "bundle.ps1 did not return binary_path"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($target)) {
+            throw "bundle.ps1 did not return target_profile_dir"
+          }
+
+          if (-not (Test-Path $binary)) {
+            throw "Built Warp binary does not exist: $binary"
+          }
+
+          $checkoutSha = git rev-parse HEAD
+
+          if ($checkoutSha -ne $env:GITHUB_SHA) {
+            throw "Checkout SHA differs from workflow SHA"
+          }
+
+          $file = Get-Item $binary
+          $hash = (
+            Get-FileHash `
+              $binary `
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          Write-Host ""
+          Write-Host (
+            "Binary size: {0:N2} MB" -f ($file.Length / 1MB)
+          )
+
+          Write-Host "Binary SHA256:"
+          Write-Host $hash
+
+
+      # ========================================================
+      # Build Checkpoint
+      #
+      # BUILD-CHECKPOINT.txt 很重要。
+      #
+      # package-only 模式以后会自动从这里读取 Binary 对应的
+      # commit，因此不需要人工再记录 source SHA。
+      # ========================================================
+      - name: Stage build checkpoint
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+
+          $checkpoint = Join-Path `
+            $root `
+            "checkpoint"
+
+          Remove-Item `
+            $checkpoint `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          New-Item `
+            -ItemType Directory `
+            -Path $checkpoint `
+            -Force | Out-Null
+
+          $binary = "${{ steps.build.outputs.binary_path }}"
+
+          $sourceSha = git rev-parse HEAD
+
+          $binaryHash = (
+            Get-FileHash `
+              $binary `
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          Copy-Item `
+            $binary `
+            "$checkpoint\warp-oss.exe"
+
+          @"
+          Warp Offline Build Checkpoint
+
+          Repository:
+          $env:GITHUB_REPOSITORY
+
+          Commit:
+          $sourceSha
+
+          Branch:
+          $env:GITHUB_REF_NAME
+
+          Build Run ID:
+          $env:GITHUB_RUN_ID
+
+          Binary:
+          warp-oss.exe
+
+          Binary SHA256:
+          $binaryHash
+
+          Platform:
+          Windows x86_64
+
+          Channel:
+          oss
+
+          Cargo Profile:
+          rlto
+          "@ | Set-Content `
+            "$checkpoint\BUILD-CHECKPOINT.txt" `
+            -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "Build checkpoint:"
+          Get-ChildItem $checkpoint
+
+
+      # ========================================================
+      # 这就是我们的断点。
+      #
+      # retention-days 设成 14 天：
+      # 内网测试期间如果只是打包问题，可以回来 package-only。
+      # ========================================================
+      - name: Upload build checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: warp-offline-v0-build
+          path: checkpoint
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+          if-no-files-found: error
+
+
+
+  # ============================================================
+  # 3. PACKAGE
+  #
+  # 两种模式都进入这里。
+  #
+  # FULL:
+  #
+  #   下载当前 Run 刚刚 Build 出来的 checkpoint。
+  #
+  # PACKAGE-ONLY:
+  #
+  #   下载 source_run_id 指定 Run 的 checkpoint。
+  #
+  # 然后自动读取 BUILD-CHECKPOINT.txt 中的 commit，
+  # 切换源码到当时的准确版本，再完成打包。
+  # ============================================================
+  package:
+    name: Package Portable
+
+    needs:
+      - build
+
+    if: >-
+      ${{
+        always() &&
+        (
+          inputs.mode == 'package-only' ||
+          needs.build.result == 'success'
+        )
+      }}
+
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+
+      # ========================================================
+      # 先 checkout 当前 Workflow 所在 revision。
+      #
+      # package-only 下载完 checkpoint 后，
+      # 会再通过 git checkout 切回 Binary 对应源码 commit。
+      # ========================================================
+      - name: Checkout workflow source
+        uses: actions/checkout@v6
+
+
+      # ========================================================
+      # package-only 参数检查
+      # ========================================================
+      - name: Validate package mode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $mode = "${{ inputs.mode }}"
+
+          Write-Host "Mode:"
+          Write-Host $mode
+
+          if ($mode -eq "package-only") {
+            $runId = "${{ inputs.source_run_id }}"
+
+            if ([string]::IsNullOrWhiteSpace($runId)) {
+              throw "package-only requires source_run_id"
+            }
+
+            if ($runId -notmatch '^\d+$') {
+              throw "source_run_id must be a numeric GitHub Actions run ID"
+            }
+
+            Write-Host ""
+            Write-Host "Source run ID:"
+            Write-Host $runId
+          }
+
+
+      # ========================================================
+      # FULL MODE
+      #
+      # 下载当前 Workflow Run 中刚上传的 checkpoint。
+      # ========================================================
+      - name: Download current build checkpoint
+        if: ${{ inputs.mode == 'full' }}
+
+        uses: actions/download-artifact@v4
+
+        with:
+          name: warp-offline-v0-build
+          path: checkpoint
+
+
+      # ========================================================
+      # PACKAGE-ONLY MODE
+      #
+      # 跨 Run 下载以前 Build 好的 checkpoint。
+      # ========================================================
+      - name: Download existing build checkpoint
+        if: ${{ inputs.mode == 'package-only' }}
+
+        uses: actions/download-artifact@v4
+
+        with:
+          name: warp-offline-v0-build
+          path: checkpoint
+
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+
+      # ========================================================
+      # 从 checkpoint 自动解析：
+      #
+      #   source SHA
+      #   source run ID
+      #
+      # 这样 package-only 不需要人工输入 commit。
+      # ========================================================
+      - name: Resolve build source
+        id: resolve
+
+        shell: pwsh
+
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $checkpoint = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "checkpoint"
+
+          $binary = Join-Path `
+            $checkpoint `
+            "warp-oss.exe"
+
+          $info = Join-Path `
+            $checkpoint `
+            "BUILD-CHECKPOINT.txt"
+
+          if (-not (Test-Path $binary)) {
+            throw "Checkpoint does not contain warp-oss.exe"
+          }
+
+          if (-not (Test-Path $info)) {
+            throw "Checkpoint does not contain BUILD-CHECKPOINT.txt"
+          }
+
+          $raw = Get-Content $info -Raw
+
+          $commitMatch = [regex]::Match(
+            $raw,
+            'Commit:\s*\r?\n\s*([0-9a-fA-F]{40})'
+          )
+
+          if (-not $commitMatch.Success) {
+            throw "Unable to read source commit from BUILD-CHECKPOINT.txt"
+          }
+
+          $sourceSha = $commitMatch.Groups[1].Value.ToLower()
+
+          $mode = "${{ inputs.mode }}"
+
+          if ($mode -eq "full") {
+            $sourceRunId = $env:GITHUB_RUN_ID
+          }
+          else {
+            $sourceRunId = "${{ inputs.source_run_id }}"
+          }
+
+          Write-Host "Binary source commit:"
+          Write-Host $sourceSha
+
+          Write-Host ""
+          Write-Host "Build source run:"
+          Write-Host $sourceRunId
+
+          "source_sha=$sourceSha" >>
+            $env:GITHUB_OUTPUT
+
+          "source_run_id=$sourceRunId" >>
+            $env:GITHUB_OUTPUT
+
+
+      # ========================================================
+      # 如果是 package-only：
+      #
+      # 当前 checkout 是新 Workflow 的 master。
+      #
+      # 但 Binary 可能来自几天前的 commit。
+      #
+      # 所以必须切回 Binary 当时的源码版本，
+      # 确保：
+      #
+      #   DLL
+      #   resources
+      #   scripts
+      #   licenses
+      #
+      # 都和 binary 对应。
+      #
+      # 注意：
+      #
+      # 不执行 git clean，
+      # 因为 checkpoint 是 untracked 文件，必须保留。
+      # ========================================================
+      - name: Switch to exact binary source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $expected = "${{ steps.resolve.outputs.source_sha }}"
+
+          $current = git rev-parse HEAD
+
+          Write-Host "Current checkout:"
+          Write-Host $current
+
+          Write-Host ""
+          Write-Host "Required source:"
+          Write-Host $expected
+
+          if ($current -ne $expected) {
+
+            Write-Host ""
+            Write-Host "Fetching exact source commit..."
+
+            git fetch `
+              --no-tags `
+              --depth=1 `
+              origin `
+              $expected
+
+            if (-not $?) {
+              throw "Failed to fetch source commit $expected"
+            }
+
+            git checkout `
+              --detach `
+              $expected
+
+            if (-not $?) {
+              throw "Failed to checkout source commit $expected"
+            }
+          }
+
+          $actual = git rev-parse HEAD
+
+          if ($actual -ne $expected) {
+            throw "Source checkout mismatch. Expected $expected, got $actual"
+          }
+
+          Write-Host ""
+          Write-Host "Exact binary source checkout OK"
+
+
+      # ========================================================
+      # 验证 checkpoint binary。
+      #
+      # 新版 checkpoint 会包含 Binary SHA256。
+      #
+      # 为了兼容我们之前已经成功生成的旧 checkpoint，
+      # 如果旧文件里没有 hash，则只 warning，不阻断。
+      # ========================================================
+      - name: Verify checkpoint binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $checkpoint = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "checkpoint"
+
+          $binary = Join-Path `
+            $checkpoint `
+            "warp-oss.exe"
+
+          $info = Join-Path `
+            $checkpoint `
+            "BUILD-CHECKPOINT.txt"
+
+          $file = Get-Item $binary
+
+          $actualHash = (
+            Get-FileHash `
+              $binary `
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          Write-Host (
+            "Binary size: {0:N2} MB" -f ($file.Length / 1MB)
+          )
+
+          Write-Host "Binary SHA256:"
+          Write-Host $actualHash
+
+          $raw = Get-Content $info -Raw
+
+          $hashMatch = [regex]::Match(
+            $raw,
+            'Binary SHA256:\s*\r?\n\s*([0-9a-fA-F]{64})'
+          )
+
+          if ($hashMatch.Success) {
+
+            $expectedHash = `
+              $hashMatch.Groups[1].Value.ToLower()
+
+            if ($actualHash -ne $expectedHash) {
+              throw "Checkpoint binary SHA256 mismatch"
+            }
+
+            Write-Host ""
+            Write-Host "Checkpoint SHA256 verification passed"
+          }
+          else {
+            Write-Warning `
+              "Old checkpoint has no Binary SHA256 field; skipping hash comparison."
+          }
+
+
+      # ========================================================
+      # Package 阶段自己的轻量 Preflight。
+      #
+      # package-only 可能来自旧 source commit，
+      # 所以这里针对那个准确 commit 再检查一次打包依赖。
+      # ========================================================
+      - name: Verify package source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+
+          $required = @(
+            "script\windows\prepare_bundled_resources.ps1",
+            "app\assets\windows\x64\conpty.dll",
+            "app\assets\windows\x64\OpenConsole.exe",
+            "app\assets\windows\x64\dxcompiler.dll",
+            "app\assets\windows\x64\dxil.dll",
+            "app\assets\windows\x64\msvcp140.dll",
+            "app\assets\windows\x64\vcruntime140.dll",
+            "app\assets\windows\x64\vcruntime140_1.dll",
+            "app\assets\bundled\bootstrap\pwsh.ps1",
+            "app\channels\oss\icon\no-padding\icon.ico",
+            "LICENSE-AGPL",
+            "LICENSE-MIT",
+            "resources"
+          )
+
+          foreach ($relative in $required) {
+            $path = Join-Path $root $relative
+
+            if (-not (Test-Path $path)) {
+              throw "Package source missing: $relative"
+            }
+
+            Write-Host "OK  $relative"
+          }
+
+
+      # ========================================================
+      # prepare_bundled_resources.ps1 会调用：
+      #
+      # cargo about generate
+      #
+      # GitHub Windows runner 默认没有 cargo-about。
+      #
+      # 固定使用我们已经实际跑通的 0.9.2，
+      # 避免以后 latest 变化带来新的不确定性。
+      # ========================================================
+      - name: Install cargo-about
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cargo --version
+          rustc --version
+
+          Write-Host ""
+          Write-Host "Installing cargo-about 0.9.2..."
+
+          cargo install `
+            --locked `
+            --features cli `
+            --version 0.9.2 `
+            cargo-about
+
+          if (-not $?) {
+            throw "cargo-about installation failed"
+          }
+
+          Write-Host ""
+          cargo about --version
+
+
+      # ========================================================
+      # 为 warp-oss.exe 准备运行时 DLL。
+      #
+      # 资源脚本会执行：
+      #
+      # warp-oss.exe dump-settings-schema
+      #
+      # 所以裸 EXE 不够。
+      # ========================================================
+      - name: Prepare binary runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+
+          $checkpoint = Join-Path `
+            $root `
+            "checkpoint"
+
+          $assets = Join-Path `
+            $root `
+            "app\assets\windows\x64"
+
+          New-Item `
+            -ItemType Directory `
+            -Path "$checkpoint\x64" `
+            -Force | Out-Null
+
+          Copy-Item `
+            "$assets\conpty.dll" `
+            "$checkpoint\conpty.dll" `
+            -Force
+
+          Copy-Item `
+            "$assets\dxcompiler.dll" `
+            "$checkpoint\dxcompiler.dll" `
+            -Force
+
+          Copy-Item `
+            "$assets\dxil.dll" `
+            "$checkpoint\dxil.dll" `
+            -Force
+
+          Copy-Item `
+            "$assets\msvcp140.dll" `
+            "$checkpoint\msvcp140.dll" `
+            -Force
+
+          Copy-Item `
+            "$assets\vcruntime140.dll" `
+            "$checkpoint\vcruntime140.dll" `
+            -Force
+
+          Copy-Item `
+            "$assets\vcruntime140_1.dll" `
+            "$checkpoint\vcruntime140_1.dll" `
+            -Force
+
+          Copy-Item `
+            "$assets\OpenConsole.exe" `
+            "$checkpoint\x64\OpenConsole.exe" `
+            -Force
+
+          Write-Host "Runtime prepared:"
+          Get-ChildItem $checkpoint
+
+
+      # ========================================================
+      # Bundled Resources
+      #
+      # 已经实际验证过的流程：
+      #
+      #   bundled/
+      #
+      #   cargo about
+      #      ↓
+      #   THIRD_PARTY_LICENSES.txt
+      #
+      #   warp-oss.exe dump-settings-schema
+      #      ↓
+      #   settings_schema.json
+      # ========================================================
+      - name: Prepare bundled resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+
+          $resourcesOut = Join-Path `
+            $env:RUNNER_TEMP `
+            "warp-resources"
+
+          $binary = Join-Path `
+            $root `
+            "checkpoint\warp-oss.exe"
+
+          Remove-Item `
+            $resourcesOut `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          $env:SETTINGS_SCHEMA_EXECUTABLE = $binary
+
+          Write-Host "SETTINGS_SCHEMA_EXECUTABLE:"
+          Write-Host $env:SETTINGS_SCHEMA_EXECUTABLE
+
+          & .\script\windows\prepare_bundled_resources.ps1 `
+            -DestinationDir $resourcesOut `
+            -Channel oss
+
+          if (-not $?) {
+            throw "prepare_bundled_resources.ps1 failed"
+          }
+
+          $required = @(
+            "bundled",
+            "THIRD_PARTY_LICENSES.txt",
+            "settings_schema.json"
+          )
+
+          foreach ($item in $required) {
+            $path = Join-Path `
+              $resourcesOut `
+              $item
+
+            if (-not (Test-Path $path)) {
+              throw "Generated resource missing: $item"
+            }
+
+            Write-Host "OK  $item"
+          }
+
+          Write-Host ""
+          Write-Host "Resources generated successfully"
+
+
+      # ========================================================
+      # Portable Directory
+      # ========================================================
+      - name: Assemble portable directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+
+          $assets = Join-Path `
+            $root `
+            "app\assets\windows\x64"
+
+          $resourcesSource = Join-Path `
+            $env:RUNNER_TEMP `
+            "warp-resources"
+
+          $dist = Join-Path `
+            $root `
+            "dist"
+
+          $out = Join-Path `
+            $dist `
+            "Warp-Offline-v0-win-x64"
+
+          Remove-Item `
+            $dist `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          New-Item `
+            -ItemType Directory `
+            -Path "$out\x64" `
+            -Force | Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Path "$out\resources" `
+            -Force | Out-Null
+
+
+          # ------------------------------------------------------
+          # Warp
+          # ------------------------------------------------------
+          Copy-Item `
+            "$root\checkpoint\warp-oss.exe" `
+            "$out\warp-oss.exe"
+
+
+          # ------------------------------------------------------
+          # Windows Console Runtime
+          # ------------------------------------------------------
+          Copy-Item `
+            "$assets\conpty.dll" `
+            "$out\conpty.dll"
+
+          Copy-Item `
+            "$assets\OpenConsole.exe" `
+            "$out\x64\OpenConsole.exe"
+
+
+          # ------------------------------------------------------
+          # DirectX Shader Compiler
+          # ------------------------------------------------------
+          Copy-Item `
+            "$assets\dxcompiler.dll" `
+            "$out\dxcompiler.dll"
+
+          Copy-Item `
+            "$assets\dxil.dll" `
+            "$out\dxil.dll"
+
+
+          # ------------------------------------------------------
+          # VC Runtime
+          # ------------------------------------------------------
+          Copy-Item `
+            "$assets\msvcp140.dll" `
+            "$out\msvcp140.dll"
+
+          Copy-Item `
+            "$assets\vcruntime140.dll" `
+            "$out\vcruntime140.dll"
+
+          Copy-Item `
+            "$assets\vcruntime140_1.dll" `
+            "$out\vcruntime140_1.dll"
+
+
+          # ------------------------------------------------------
+          # PowerShell bootstrap
+          # ------------------------------------------------------
+          Copy-Item `
+            "$root\app\assets\bundled\bootstrap\pwsh.ps1" `
+            "$out\pwsh.ps1"
+
+
+          # ------------------------------------------------------
+          # OSS icon
+          # ------------------------------------------------------
+          Copy-Item `
+            "$root\app\channels\oss\icon\no-padding\icon.ico" `
+            "$out\icon.ico"
+
+
+          # ------------------------------------------------------
+          # Generated resources
+          # ------------------------------------------------------
+          Copy-Item `
+            "$resourcesSource\*" `
+            "$out\resources" `
+            -Recurse `
+            -Force
+
+
+          # ------------------------------------------------------
+          # Licenses
+          # ------------------------------------------------------
+          Copy-Item `
+            "$root\LICENSE-AGPL" `
+            "$out\LICENSE-AGPL"
+
+          Copy-Item `
+            "$root\LICENSE-MIT" `
+            "$out\LICENSE-MIT"
+
+
+          # ------------------------------------------------------
+          # Build trace
+          # ------------------------------------------------------
+          $sourceSha = `
+            "${{ steps.resolve.outputs.source_sha }}"
+
+          $sourceRunId = `
+            "${{ steps.resolve.outputs.source_run_id }}"
+
+          $binaryHash = (
+            Get-FileHash `
+              "$out\warp-oss.exe" `
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          @"
+          Warp Offline V0
+
+          Repository:
+          $env:GITHUB_REPOSITORY
+
+          Binary Source Commit:
+          $sourceSha
+
+          Binary Build Run ID:
+          $sourceRunId
+
+          Packaging Run ID:
+          $env:GITHUB_RUN_ID
+
+          Build Mode:
+          ${{ inputs.mode }}
+
+          Binary SHA256:
+          $binaryHash
+
+          Platform:
+          Windows x86_64
+
+          Channel:
+          oss
+
+          Cargo Profile:
+          rlto
+
+          Offline Modification:
+          First-run offline state is allowed to enter Warp's
+          existing loginless / SkippedLogin flow.
+
+          Packaging:
+          GitHub Actions
+          "@ | Set-Content `
+            "$out\BUILD-INFO.txt" `
+            -Encoding UTF8
+
+
+      # ========================================================
+      # 最终 Payload Verification
+      # ========================================================
+      - name: Verify portable layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "dist\Warp-Offline-v0-win-x64"
+
+          $required = @(
+            "warp-oss.exe",
+            "conpty.dll",
+            "dxcompiler.dll",
+            "dxil.dll",
+            "msvcp140.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "pwsh.ps1",
+            "icon.ico",
+            "x64\OpenConsole.exe",
+            "resources\bundled",
+            "resources\THIRD_PARTY_LICENSES.txt",
+            "resources\settings_schema.json",
+            "LICENSE-AGPL",
+            "LICENSE-MIT",
+            "BUILD-INFO.txt"
+          )
+
+          foreach ($relative in $required) {
+            $path = Join-Path `
+              $out `
+              $relative
+
+            if (-not (Test-Path $path)) {
+              throw "Portable payload missing: $relative"
+            }
+
+            Write-Host "OK  $relative"
+          }
+
+          $fileCount = (
+            Get-ChildItem `
+              $out `
+              -Recurse `
+              -File
+          ).Count
+
+          $bytes = (
+            Get-ChildItem `
+              $out `
+              -Recurse `
+              -File |
+            Measure-Object `
+              Length `
+              -Sum
+          ).Sum
+
+          $binaryHash = (
+            Get-FileHash `
+              "$out\warp-oss.exe" `
+              -Algorithm SHA256
+          ).Hash.ToLower()
+
+          Write-Host ""
+          Write-Host "Portable file count:"
+          Write-Host $fileCount
+
+          Write-Host ""
+          Write-Host (
+            "Portable size: {0:N2} MB" -f ($bytes / 1MB)
+          )
+
+          Write-Host ""
+          Write-Host "warp-oss.exe SHA256:"
+          Write-Host $binaryHash
+
+          Write-Host ""
+          Write-Host "Portable layout verification passed"
+
+
+      # ========================================================
+      # 最终 Artifact
+      #
+      # GitHub 下载时会得到 ZIP。
+      # ========================================================
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: Warp-Offline-v0-win-x64
+          path: dist/Warp-Offline-v0-win-x64
+          retention-days: 14
+          compression-level: 6
+          overwrite: true
+          if-no-files-found: error
