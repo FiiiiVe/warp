@@ -1,4 +1,4 @@
-name: Warp Offline V0 - Windows Portable
+name: Warp Offline V0 - Windows Portable 2
 
 on:
   workflow_dispatch:
