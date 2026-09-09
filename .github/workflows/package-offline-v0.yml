@@ -1,0 +1,429 @@
+name: Warp Offline V0 - Package Existing Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    name: Package Existing Warp Build
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+
+      # ============================================================
+      # 1. Checkout 与已经编译好的 EXE 完全相同的源码版本
+      #
+      # 原 Build Artifact 来自：
+      # run 34247886037
+      # commit 6bbb58b34e355957d384afb3d60d840f6e1b5286
+      # ============================================================
+      - name: Checkout exact build source
+        uses: actions/checkout@v6
+        with:
+          ref: 6bbb58b34e355957d384afb3d60d840f6e1b5286
+
+      - name: Show source revision
+        shell: pwsh
+        run: |
+          Write-Host "Expected build commit:"
+          Write-Host "6bbb58b34e355957d384afb3d60d840f6e1b5286"
+
+          Write-Host ""
+          Write-Host "Actual checkout:"
+          git rev-parse HEAD
+
+          $actual = git rev-parse HEAD
+
+          if ($actual -ne "6bbb58b34e355957d384afb3d60d840f6e1b5286") {
+            throw "Source commit does not match binary build commit"
+          }
+
+      # ============================================================
+      # 2. 从之前成功的 run 直接下载 376 MB warp-oss.exe
+      #
+      # 不执行 cargo build。
+      # ============================================================
+      - name: Download existing build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: warp-offline-v0-build
+          path: checkpoint
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: FiiiiVe/warp
+          run-id: 34247886037
+
+      - name: Verify existing binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $binary = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "checkpoint\warp-oss.exe"
+
+          if (-not (Test-Path $binary)) {
+            throw "warp-oss.exe was not downloaded"
+          }
+
+          $file = Get-Item $binary
+
+          Write-Host "Existing Warp binary:"
+          Write-Host $file.FullName
+          Write-Host ("Size: {0:N2} MB" -f ($file.Length / 1MB))
+
+      # ============================================================
+      # 3. prepare_bundled_resources.ps1 要执行 cargo about
+      #
+      # 当前 Package runner 没有 cargo-about，所以显式安装。
+      # ============================================================
+      - name: Install cargo-about
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cargo --version
+          rustc --version
+
+          cargo install `
+            --locked `
+            --features cli `
+            cargo-about
+
+          if (-not $?) {
+            throw "cargo-about installation failed"
+          }
+
+          Write-Host ""
+          cargo about --version
+
+      # ============================================================
+      # 4. 为 warp-oss.exe 补齐 runtime sidecars
+      #
+      # prepare_bundled_resources 下一步需要调用：
+      #
+      # warp-oss.exe dump-settings-schema ...
+      #
+      # 所以不能只放一个裸 EXE。
+      # ============================================================
+      - name: Prepare binary runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+          $checkpoint = Join-Path $root "checkpoint"
+          $assets = Join-Path $root "app\assets\windows\x64"
+
+          New-Item `
+            -ItemType Directory `
+            -Path "$checkpoint\x64" `
+            -Force | Out-Null
+
+          Copy-Item `
+            "$assets\conpty.dll" `
+            "$checkpoint\conpty.dll"
+
+          Copy-Item `
+            "$assets\dxcompiler.dll" `
+            "$checkpoint\dxcompiler.dll"
+
+          Copy-Item `
+            "$assets\dxil.dll" `
+            "$checkpoint\dxil.dll"
+
+          Copy-Item `
+            "$assets\msvcp140.dll" `
+            "$checkpoint\msvcp140.dll"
+
+          Copy-Item `
+            "$assets\vcruntime140.dll" `
+            "$checkpoint\vcruntime140.dll"
+
+          Copy-Item `
+            "$assets\vcruntime140_1.dll" `
+            "$checkpoint\vcruntime140_1.dll"
+
+          Copy-Item `
+            "$assets\OpenConsole.exe" `
+            "$checkpoint\x64\OpenConsole.exe"
+
+          Write-Host "Runtime prepared:"
+          Get-ChildItem $checkpoint
+
+      # ============================================================
+      # 5. 生成真正的 bundled resources
+      #
+      # 当前脚本实际会：
+      # - copy bundled resources
+      # - cargo about -> THIRD_PARTY_LICENSES.txt
+      # - warp-oss.exe dump-settings-schema -> settings_schema.json
+      # ============================================================
+      - name: Prepare bundled resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+
+          $resourcesOut = Join-Path `
+            $env:RUNNER_TEMP `
+            "warp-resources"
+
+          $binary = Join-Path `
+            $root `
+            "checkpoint\warp-oss.exe"
+
+          Remove-Item `
+            $resourcesOut `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          # 官方 bundle.ps1 正常构建就是这样告诉资源脚本：
+          # 用刚编译出的 Warp 自己生成 settings schema。
+          $env:SETTINGS_SCHEMA_EXECUTABLE = $binary
+
+          Write-Host "SETTINGS_SCHEMA_EXECUTABLE:"
+          Write-Host $env:SETTINGS_SCHEMA_EXECUTABLE
+
+          & .\script\windows\prepare_bundled_resources.ps1 `
+            -DestinationDir $resourcesOut `
+            -Channel oss
+
+          if (-not $?) {
+            throw "prepare_bundled_resources.ps1 failed"
+          }
+
+          $required = @(
+            "bundled",
+            "THIRD_PARTY_LICENSES.txt",
+            "settings_schema.json"
+          )
+
+          foreach ($item in $required) {
+            $path = Join-Path $resourcesOut $item
+
+            if (-not (Test-Path $path)) {
+              throw "Generated resource missing: $item"
+            }
+
+            Write-Host "OK  $item"
+          }
+
+          Write-Host ""
+          Write-Host "Resources generated successfully"
+
+      # ============================================================
+      # 6. 组装 Portable
+      # ============================================================
+      - name: Assemble portable directory
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $root = $env:GITHUB_WORKSPACE
+          $assets = Join-Path $root "app\assets\windows\x64"
+
+          $resourcesSource = Join-Path `
+            $env:RUNNER_TEMP `
+            "warp-resources"
+
+          $out = Join-Path `
+            $root `
+            "dist\Warp-Offline-v0-win-x64"
+
+          Remove-Item `
+            (Join-Path $root "dist") `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          New-Item `
+            -ItemType Directory `
+            -Path "$out\x64" `
+            -Force | Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Path "$out\resources" `
+            -Force | Out-Null
+
+
+          # Warp
+          Copy-Item `
+            "$root\checkpoint\warp-oss.exe" `
+            "$out\warp-oss.exe"
+
+
+          # Windows runtime
+          Copy-Item `
+            "$assets\conpty.dll" `
+            "$out\conpty.dll"
+
+          Copy-Item `
+            "$assets\OpenConsole.exe" `
+            "$out\x64\OpenConsole.exe"
+
+
+          # DirectX
+          Copy-Item `
+            "$assets\dxcompiler.dll" `
+            "$out\dxcompiler.dll"
+
+          Copy-Item `
+            "$assets\dxil.dll" `
+            "$out\dxil.dll"
+
+
+          # VC runtime
+          Copy-Item `
+            "$assets\msvcp140.dll" `
+            "$out\msvcp140.dll"
+
+          Copy-Item `
+            "$assets\vcruntime140.dll" `
+            "$out\vcruntime140.dll"
+
+          Copy-Item `
+            "$assets\vcruntime140_1.dll" `
+            "$out\vcruntime140_1.dll"
+
+
+          # PowerShell integration
+          Copy-Item `
+            "$root\app\assets\bundled\bootstrap\pwsh.ps1" `
+            "$out\pwsh.ps1"
+
+
+          # Icon
+          Copy-Item `
+            "$root\app\channels\oss\icon\no-padding\icon.ico" `
+            "$out\icon.ico"
+
+
+          # Generated resources
+          Copy-Item `
+            "$resourcesSource\*" `
+            "$out\resources" `
+            -Recurse `
+            -Force
+
+
+          # Licenses
+          Copy-Item `
+            "$root\LICENSE-AGPL" `
+            "$out\LICENSE-AGPL"
+
+          Copy-Item `
+            "$root\LICENSE-MIT" `
+            "$out\LICENSE-MIT"
+
+
+          # Build info
+          @"
+          Warp Offline V0
+
+          Source repository:
+          FiiiiVe/warp
+
+          Binary source commit:
+          6bbb58b34e355957d384afb3d60d840f6e1b5286
+
+          Original build run:
+          34247886037
+
+          Build artifact:
+          warp-offline-v0-build
+
+          Platform:
+          Windows x86_64
+
+          Channel:
+          oss
+
+          Cargo profile:
+          rlto
+
+          Offline modification:
+          Allow first-run offline state to enter Warp's
+          existing loginless / SkippedLogin flow.
+
+          Packaging:
+          GitHub Actions
+          "@ | Set-Content `
+            "$out\BUILD-INFO.txt" `
+            -Encoding UTF8
+
+      # ============================================================
+      # 7. 最终静态检查
+      # ============================================================
+      - name: Verify portable layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "dist\Warp-Offline-v0-win-x64"
+
+          $required = @(
+            "warp-oss.exe",
+            "conpty.dll",
+            "dxcompiler.dll",
+            "dxil.dll",
+            "msvcp140.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "pwsh.ps1",
+            "icon.ico",
+            "x64\OpenConsole.exe",
+            "resources\bundled",
+            "resources\THIRD_PARTY_LICENSES.txt",
+            "resources\settings_schema.json",
+            "LICENSE-AGPL",
+            "LICENSE-MIT",
+            "BUILD-INFO.txt"
+          )
+
+          foreach ($relative in $required) {
+            $path = Join-Path $out $relative
+
+            if (-not (Test-Path $path)) {
+              throw "Portable payload missing: $relative"
+            }
+
+            Write-Host "OK  $relative"
+          }
+
+          $bytes = (
+            Get-ChildItem `
+              $out `
+              -Recurse `
+              -File |
+            Measure-Object Length -Sum
+          ).Sum
+
+          Write-Host ""
+          Write-Host (
+            "Portable size: {0:N2} MB" -f ($bytes / 1MB)
+          )
+
+          Write-Host ""
+          Write-Host "Portable layout verification passed"
+
+      # ============================================================
+      # 8. 最终下载产物
+      # ============================================================
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Warp-Offline-v0-win-x64
+          path: dist/Warp-Offline-v0-win-x64
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
