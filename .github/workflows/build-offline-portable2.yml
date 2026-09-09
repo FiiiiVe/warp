@@ -357,6 +357,10 @@ jobs:
           Get-Item $binary |
             Select-Object Name, Length
 
+      - name: Install cargo-about
+        shell: pwsh
+        run: |
+          cargo install --locked --features cli cargo-about
       # ----------------------------------------------------------
       # 使用你当前 fork 的真实接口：
       #
